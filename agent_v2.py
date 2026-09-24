@@ -597,7 +597,7 @@ def ask(q: str):
             del history[: -2 * HISTORY_TURNS]
             return text, f"{provider}/{model}"
         soonest = min(cooldown.get(k, 0) for k in chain) - time.time()
-        if attempt == 0 and 0 < soonest <= 65:
+        if attempt < 2 and 0 < soonest <= 130:
             print(f"(all models busy, waiting {soonest:.0f}s...)")
             time.sleep(soonest + 1)
             continue
