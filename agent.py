@@ -14,6 +14,7 @@ to the next one when a provider hits its quota or is overloaded.
 Install:  pip install google-genai openai PyGithub datasets huggingface_hub python-dotenv
 Run:      python agent.py
 """
+import difflib
 import inspect
 import json
 import os
@@ -23,7 +24,7 @@ import time
 from itertools import islice
 
 from dotenv import load_dotenv
-from github import Auth, Github
+from github import Auth, Github, GithubException
 from datasets import load_dataset
 from huggingface_hub import HfApi
 from google import genai
@@ -40,6 +41,7 @@ DEFAULT_REPO = "amanx98/Flyrank-internship-notebook"
 DEFAULT_DATASET = "FlyRank/internship-warehouse"
 MAX_CHARS = 6000       # cap on any single tool output (free tiers limit tokens/minute)
 MAX_TOOL_STEPS = 6     # max tool calls per question on the OpenAI-style providers
+MAX_ANSWER_TOKENS = 2500  # cap per reply so free tiers don't reserve huge token budgets
 HISTORY_TURNS = 8      # how many past question/answer pairs to keep
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
@@ -67,15 +69,41 @@ def _notebook_to_text(raw: str) -> str:
     return "\n\n".join(parts)
 
 
+_tree_cache: dict[str, list[str]] = {}
+
+
+def _repo_paths(repo: str) -> list[str]:
+    """All file paths in a repo, fetched once and cached."""
+    if repo not in _tree_cache:
+        r = gh.get_repo(repo)
+        tree = r.get_git_tree(r.default_branch, recursive=True)
+        _tree_cache[repo] = [t.path for t in tree.tree if t.type == "blob"]
+    return _tree_cache[repo]
+
+
+def _not_found_hint(repo: str, path: str) -> str:
+    """When a path doesn't exist (e.g. a typo), suggest the closest real paths."""
+    try:
+        paths = _repo_paths(repo)
+        close = difflib.get_close_matches(path, paths, n=4, cutoff=0.5)
+        if not close:  # try matching on the file name alone
+            names = {p.rsplit("/", 1)[-1]: p for p in paths}
+            close = [names[n] for n in difflib.get_close_matches(
+                path.rsplit("/", 1)[-1], list(names), n=4, cutoff=0.5)]
+        if close:
+            return "Not found. Did you mean one of these exact paths? " + ", ".join(close)
+    except Exception:
+        pass
+    return "Not found. Call repo_tree to see the exact file paths."
+
+
 # ------------------------------ tools ---------------------------------
 # Models read these docstrings to decide when and how to call each tool.
 
 def repo_tree(repo: str) -> str:
     """List every file path in a GitHub repo (full folder structure). repo is 'owner/name'."""
     try:
-        r = gh.get_repo(repo)
-        tree = r.get_git_tree(r.default_branch, recursive=True)
-        return _truncate("\n".join(t.path for t in tree.tree if t.type == "blob"))
+        return _truncate("\n".join(_repo_paths(repo)))
     except Exception as e:
         return f"Error: {e}"
 
@@ -92,6 +120,10 @@ def read_repo_file(repo: str, path: str, offset: int) -> str:
         if path.endswith(".ipynb"):
             text = _notebook_to_text(text)
         return _truncate(text, offset)
+    except GithubException as e:
+        if e.status == 404:
+            return _not_found_hint(repo, path)
+        return f"Error: {e}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -168,9 +200,7 @@ TOOLS_SPEC = [
 def _preload_tree() -> str:
     """Put the repo's file list in the system prompt so the agent needn't spend a request on it."""
     try:
-        r = gh.get_repo(DEFAULT_REPO)
-        tree = r.get_git_tree(r.default_branch, recursive=True)
-        return "\n".join(t.path for t in tree.tree if t.type == "blob")[:3000]
+        return "\n".join(_repo_paths(DEFAULT_REPO))[:3000]
     except Exception:
         return "(could not load the file list; use the repo_tree tool)"
 
@@ -182,6 +212,13 @@ When I say "my repo", "the repo", "my data" or "the dataset", use those.
 Use your tools instead of guessing about file contents or data. If you don't know how the
 dataset is organised, call list_dataset_files first. Each tool call is expensive, so read
 only the files you actually need. Be concise and say clearly when a tool returned an error.
+
+Rules:
+- I make typos. Never copy a path from my message; use the exact paths from the file list
+  below (for example "notboks" means "notebooks").
+- Only state facts about my repo or data that you actually read with a tool. If you haven't
+  read something, say so and read it. Never invent steps, buttons, links or requirements.
+- If a tool says "Not found", use one of its suggested paths instead of retrying the same one.
 
 Files currently in my main repo:
 {_preload_tree()}"""
@@ -297,7 +334,8 @@ def call_openai(provider: str, model: str, history: list[dict], q: str) -> str:
     messages = [{"role": "system", "content": SYSTEM}] + history + [{"role": "user", "content": q}]
     for _ in range(MAX_TOOL_STEPS):
         resp = client.chat.completions.create(
-            model=model, messages=messages, tools=TOOLS_SPEC, tool_choice="auto"
+            model=model, messages=messages, tools=TOOLS_SPEC, tool_choice="auto",
+            max_tokens=MAX_ANSWER_TOKENS,
         )
         msg = resp.choices[0].message
         if not msg.tool_calls:
@@ -317,7 +355,17 @@ def call_openai(provider: str, model: str, history: list[dict], q: str) -> str:
             except json.JSONDecodeError:
                 args = {}
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": run_tool(tc.function.name, args)})
-    return "(Stopped: too many tool calls for one question. Try asking something narrower.)"
+    # Tool budget used up: make the model answer from what it has gathered.
+    messages.append({
+        "role": "user",
+        "content": "Stop calling tools. Using only what you have read so far, answer my question "
+                   "now. If something is missing, say exactly what you could not read.",
+    })
+    resp = client.chat.completions.create(
+        model=model, messages=messages, tools=TOOLS_SPEC, tool_choice="none",
+        max_tokens=MAX_ANSWER_TOKENS,
+    )
+    return resp.choices[0].message.content or "(no answer)"
 
 
 def cooldown_for(e: Exception) -> float:
@@ -360,7 +408,7 @@ def ask(q: str):
             except Exception as e:
                 wait = cooldown_for(e)
                 cooldown[key] = time.time() + wait
-                reason = " ".join(str(e).split())[:110]
+                reason = " ".join(str(e).split())[:450]
                 print(f"({provider}/{model} failed: {reason}. Skipping it for {max(1, round(wait / 60))} min.)")
                 continue
             history.extend([{"role": "user", "content": q}, {"role": "assistant", "content": text}])
