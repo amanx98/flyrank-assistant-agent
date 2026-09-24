@@ -1,0 +1,6 @@
+google-genai
+openai
+PyGithub
+datasets
+huggingface_hub
+python-dotenv
