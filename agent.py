@@ -9,7 +9,8 @@ to the next one when a provider hits its quota or is overloaded.
   OPENROUTER_API_KEY  https://openrouter.ai/keys
   NVIDIA_API_KEY      https://build.nvidia.com  (sign in, then "Get API Key")
   GITHUB_TOKEN        optional for public repos (needed for private ones)
-  HF_TOKEN            only needed if the dataset is private
+  HF_TOKEN            needed if the dataset is private only
+  
 
 Install:  pip install google-genai openai PyGithub datasets huggingface_hub python-dotenv
 Run:      python agent.py
